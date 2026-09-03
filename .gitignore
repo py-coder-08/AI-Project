@@ -1,0 +1,53 @@
+# Python Bytecode & Build Artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+sdist/
+
+# Virtual Environments
+.venv/
+venv/
+ENV/
+env/
+.env/
+
+# Databases, Storage & Local Caches
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+*.db-wal
+*.db-shm
+*.duckdb
+
+# Environment Variables & Credentials
+.env
+.env.*
+!.env.example
+secrets.json
+*.pem
+*.key
+
+# IDEs, Editors & OS Metadata
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Testing, Logs & Profiling
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+*.log
+
+# Jupyter & Data Science Caches
+.ipynb_checkpoints
