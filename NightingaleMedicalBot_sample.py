@@ -1,0 +1,545 @@
+import os
+import re
+import sys
+import json
+import inspect
+import sqlite3
+import datetime
+import getpass
+import unittest
+import requests
+from dataclasses import dataclass, field
+from typing import Any, Callable, Annotated, get_origin, get_args, Union, Final
+from rich.console import Console
+
+
+# ==============================================================================
+# 1. DATABASE SCHEMA, LIVING MEMORY & PROVENANCE
+# ==============================================================================
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_DB_PATH = os.path.join(BASE_DIR, "nightingale_memory.db")
+
+class PatientMemoryDB:
+    def __init__(self, db_path: str = DEFAULT_DB_PATH):
+        self.db_path = db_path
+        self._init_db()
+
+    def _get_connection(self):
+        return sqlite3.connect(self.db_path)
+
+    def _init_db(self):
+        """Initializes SQLite schema for living memory, escalations, and audit logs with auto-repair."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            
+            # Auto-repair check: Inspect table definition stored in sqlite_master
+            cursor.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='escalations'")
+            row = cursor.fetchone()
+            if row and ("DEFAULTNT_TIMESTAMP" in row[0] or "clinician_response" not in row[0]):
+                # Drop corrupted legacy table automatically
+                cursor.execute("DROP TABLE escalations")
+
+            # Patient Memory Records (Living Memory with Provenance & Audio Support)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS patient_records (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    patient_id TEXT NOT NULL,
+                    category TEXT NOT NULL CHECK (category IN ('medication', 'allergy', 'symptom', 'chronic_condition', 'chief_complaint')),
+                    value TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'stopped', 'resolved')),
+                    provenance_pointer TEXT,
+                    audio_transcript_id TEXT,
+                    reported_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(patient_id, category, value)
+                )
+            """)
+
+            # Escalation Payload Store (Send to Clinic Payload)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS escalations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    patient_id TEXT NOT NULL,
+                    triggering_message TEXT NOT NULL,
+                    triage_summary TEXT NOT NULL,
+                    profile_snapshot TEXT NOT NULL,
+                    provenance_pointer TEXT,
+                    acquisition_context TEXT,
+                    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'reviewed', 'resolved')),
+                    clinician_response TEXT,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            # Audit Logs (PHI-Free Structured Event Logging)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS audit_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    metadata_json TEXT NOT NULL,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            conn.commit()
+
+    def log_audit_event(self, user_id: str, event_type: str, metadata: dict):
+        """Logs PHI-free structured JSON metadata."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO audit_logs (user_id, event_type, metadata_json)
+                VALUES (?, ?, ?)
+            """, (user_id, event_type, json.dumps(metadata)))
+            conn.commit()
+
+    def add_or_update_record(self, patient_id: str, category: str, value: str, status: str = "active", provenance_pointer: str = None) -> str:
+        """Inserts or mutates a patient record with full provenance tracking."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            cursor.execute("""
+                INSERT INTO patient_records (patient_id, category, value, status, provenance_pointer, reported_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(patient_id, category, value) DO UPDATE SET
+                    status = excluded.status,
+                    provenance_pointer = excluded.provenance_pointer,
+                    updated_at = excluded.updated_at
+            """, (patient_id, category, value, status, provenance_pointer, now, now))
+            conn.commit()
+            
+            self.log_audit_event(patient_id, "memory_mutation", {"category": category, "status": status})
+            return f"Recorded {category}: '{value}' (Status: {status})"
+
+    def get_patient_profile_summary(self, patient_id: str) -> str:
+        """Retrieves active medical records formatted for prompt injection."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT category, value, status, provenance_pointer, updated_at FROM patient_records
+                WHERE patient_id = ? AND status = 'active'
+                ORDER BY category, value
+            """, (patient_id,))
+            rows = cursor.fetchall()
+
+        if not rows:
+            return "No active medical records registered."
+
+        return "\n".join([f"- [{cat.upper()}] {val} (Updated: {upd})" for cat, val, _, _, upd in rows])
+
+    def create_escalation(self, patient_id: str, message: str, summary: str, snapshot: str, provenance: str, acquisition_context: str = "direct") -> int:
+        """Stores a Send to Clinic escalation payload."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO escalations (patient_id, triggering_message, triage_summary, profile_snapshot, provenance_pointer, acquisition_context)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (patient_id, message, summary, snapshot, provenance, acquisition_context))
+            conn.commit()
+            escalation_id = cursor.lastrowid
+
+            self.log_audit_event(patient_id, "escalation_sent", {"escalation_id": escalation_id})
+            return escalation_id
+        
+# ==============================================================================
+# 2. PHI REDACTION & RISK GATING ENGINE
+# ==============================================================================
+class MedicalAgentTools:
+    @staticmethod
+    def redact_phi(text: str) -> str:
+        """Redacts IC numbers, Malaysian phone numbers, emails, and names before LLM processing."""
+        ic_pattern = r'\b\d{6}[-?\s]?\d{2}[-?\s]?\d{4}\b'
+        my_phone_pattern = r'(\+?60|0)[-?\s]?(1[0-46-9]|3|4|5|6|7|8|9)[-?\s]?\d{3,4}[-?\s]?\d{4}\b'
+        email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+
+        redacted = re.sub(email_pattern, '[REDACTED_EMAIL]', text)
+        redacted = re.sub(ic_pattern, '[REDACTED_MYKAD]', redacted)
+        redacted = re.sub(my_phone_pattern, '[REDACTED_PHONE]', redacted)
+        
+        name_pattern = r'(?<=my name is )\b[A-Za-z\s@/]+\b'
+        return re.sub(name_pattern, '[REDACTED_NAME]', redacted, flags=re.IGNORECASE)
+
+    @staticmethod
+    def evaluate_emergency_risk(message: str) -> dict[str, Any]:
+        """Calculates risk_level, risk_reason, confidence, and timestamp prior to LLM response."""
+        high_risk_triggers = [
+            r'chest pain', r'crushing pain', r'difficulty breathing', 
+            r'shortness of breath', r'heavy bleeding', r'hurt myself', 
+            r'suicide', r'unconscious', r'stroke'
+        ]
+        medium_risk_triggers = [
+            r'high fever', r'persistent vomiting', r'dizziness', 
+            r'severe abdominal pain', r'fainting', r'chest feels funny'
+        ]
+
+        text_lower = message.lower()
+        now_ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        for pattern in high_risk_triggers:
+            if re.search(pattern, text_lower):
+                return {
+                    "risk_level": "High",
+                    "escalation_required": True,
+                    "confidence": "high",
+                    "risk_reason": f"Matched critical emergency trigger: '{pattern}'",
+                    "risk_provenance": now_ts,
+                    "patient_action": "Please call 999 or proceed to the nearest Emergency Room immediately."
+                }
+
+        for pattern in medium_risk_triggers:
+            if re.search(pattern, text_lower):
+                return {
+                    "risk_level": "Med",
+                    "escalation_required": True,
+                    "confidence": "med",
+                    "risk_reason": f"Matched moderate risk trigger: '{pattern}'",
+                    "risk_provenance": now_ts,
+                    "patient_action": "We recommend escalating this query to our clinic care team."
+                }
+
+        return {
+            "risk_level": "Low",
+            "escalation_required": False,
+            "confidence": "high",
+            "risk_reason": "No acute emergency triggers detected.",
+            "risk_provenance": now_ts,
+            "patient_action": None
+        }
+
+
+# ==============================================================================
+# 3. ACCESS CONTROL (RBAC ENFORCEMENT)
+# ==============================================================================
+class RBAC:
+    @staticmethod
+    def verify_access(requestor_id: str, target_patient_id: str, requestor_role: str = "patient") -> bool:
+        """Server-side access check preventing unauthorized cross-patient data retrieval."""
+        if requestor_role in ("clinician", "nurse", "staff"):
+            return True
+        return requestor_id == target_patient_id
+
+
+# ==============================================================================
+# 4. TOOL REGISTRY ARCHITECTURE
+# ==============================================================================
+@dataclass
+class Tools:
+    TOOL_SCHEMA_ATTRIBUTES: Final[str] = '__tool_schema__'
+    tools: dict[str, Callable[..., Any]] = field(default_factory=dict)
+
+    @staticmethod
+    def _annotation_to_schema(annotation: Any) -> dict[str, Any]:
+        schema: dict[str, Any] = {'type': 'string'}
+        description: str | None = None
+        origin = get_origin(annotation)
+
+        if origin is Annotated:
+            base_type, *meta = get_args(annotation)
+            schema = Tools._annotation_to_schema(base_type)
+            if meta:
+                description = str(meta[0])
+        elif annotation in (int, float):
+            schema = {'type': 'number'}
+        elif annotation is bool:
+            schema = {'type': 'boolean'}
+        elif annotation is str:
+            schema = {'type': 'string'}
+        elif annotation is dict or origin is dict:
+            schema = {'type': 'object'}
+        elif annotation is list or origin is list:
+            if origin is list:
+                schema = {'type': 'array', 'items': Tools._annotation_to_schema(get_args(annotation)[0])}
+            else:
+                schema = {'type': 'array'}
+        elif origin is Union:
+            any_of = [Tools._annotation_to_schema(arg) for arg in get_args(annotation) if arg is not type(None)]
+            if any_of:
+                schema = any_of[0]
+
+        if description:
+            schema['description'] = description
+
+        return schema
+
+    @classmethod
+    def schema_for_callable(cls, func: Callable[..., Any]) -> dict[str, Any]:
+        sig = inspect.signature(func)
+        annotations = inspect.get_annotations(func)
+
+        parameters: dict[str, Any] = {
+            'type': 'object',
+            'properties': {},
+            'required': [],
+            'additionalProperties': False,
+        }
+
+        for name, param in sig.parameters.items():
+            annotation = annotations.get(name, inspect.Parameter.empty)
+            if annotation is inspect.Parameter.empty:
+                continue
+
+            parameters['properties'][name] = cls._annotation_to_schema(annotation)
+            if param.default is param.empty:
+                parameters['required'].append(name)
+
+        return {
+            'type': 'function',
+            'function': {
+                'name': func.__name__,
+                'description': func.__doc__ or 'No description provided.',
+                'parameters': parameters,
+                'strict': True,
+            },
+        }
+
+    def get_schema(self) -> list[dict[str, Any]]:
+        return [getattr(fn, self.TOOL_SCHEMA_ATTRIBUTES) for fn in self.tools.values() if hasattr(fn, self.TOOL_SCHEMA_ATTRIBUTES)]
+
+    def register(self, func: Callable[..., Any]) -> Callable[..., Any]:
+        if getattr(func, self.TOOL_SCHEMA_ATTRIBUTES, None) is None:
+            setattr(func, self.TOOL_SCHEMA_ATTRIBUTES, self.schema_for_callable(func))
+        self.tools[func.__name__] = func
+        return func
+
+    def execute(self, tool_call: dict[str, Any]) -> dict[str, Any]:
+        fn_payload = tool_call.get('function') or {}
+        fn_name = fn_payload.get('name')
+        fn = self.tools.get(fn_name) if fn_name else None
+
+        if not fn:
+            return {'error': f'Tool "{fn_name}" not found'}
+
+        try:
+            args = json.loads(fn_payload.get('arguments') or '{}')
+            result = fn(**args)
+            return result if isinstance(result, dict) else {'result': result}
+        except Exception as e:
+            return {'error': str(e)}
+
+
+# ==============================================================================
+# 5. AGENT CORE ENGINE
+# ==============================================================================
+@dataclass
+class Agent:
+    system_prompt: str = (
+        'You are Nightingale AI, an empathetic medical assistant. Provide accurate guidance strictly NON-DIAGNOSTICALLY. '
+        'Do NOT issue diagnoses, treatment plans, or prescription changes. '
+        'Always extract structured facts using save_patient_record for medications, allergies, symptoms, or chief complaints.'
+    )
+    model: str = 'qwen/qwen3.5-9b'
+    base_url: str = 'http://localhost:1234/v1'
+    api_key: str = field(default='NO_API_KEY', repr=False)
+    tools: Tools = field(default_factory=Tools)
+    contexts: dict[str, Callable[[], str]] = field(default_factory=dict)
+    messages: list[dict[str, Any]] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        self.base_url = self.base_url.rstrip('/')
+
+    def tool(self, func: Callable[..., Any]) -> Callable[..., Any]:
+        return self.tools.register(func)
+
+    def context(self, func: Callable[[], str]) -> Callable[[], str]:
+        self.contexts[func.__name__] = func
+        return func
+
+    def chat(self, user_message: str) -> str:
+        clean_user_message = MedicalAgentTools.redact_phi(user_message)
+        self.messages.append({'role': 'user', 'content': clean_user_message})
+
+        context_content = '\n\n'.join(
+            f'<context>\n<{n}>\n{fn()}\n</{n}>\n</context>'
+            for n, fn in self.contexts.items()
+        )
+
+        prefix: list[dict[str, Any]] = [
+            {'role': 'system', 'content': self.system_prompt},
+            {'role': 'system', 'content': context_content},
+        ]
+
+        while True:
+            api_kwargs = {
+                'model': self.model,
+                'messages': prefix + self.messages,
+            }
+
+            tool_schemas = self.tools.get_schema()
+            if tool_schemas:
+                api_kwargs['tools'] = tool_schemas
+
+            url = f'{self.base_url}/chat/completions'
+            headers = {
+                'Authorization': f'Bearer {self.api_key}',
+                'Content-Type': 'application/json',
+            }
+
+            response = requests.post(url, headers=headers, json=api_kwargs, timeout=120)
+            response.raise_for_status()
+            data = response.json()
+            choices = data.get('choices')
+
+            if not choices:
+                raise RuntimeError('Model response missing choices')
+
+            message = choices[0].get('message')
+            if message is None:
+                raise RuntimeError('Model response missing message')
+
+            tool_calls = message.get('tool_calls') or []
+            self.messages.append({
+                'role': 'assistant',
+                'content': message.get('content'),
+                'tool_calls': [
+                    {
+                        'id': tc.get('id'),
+                        'type': tc.get('type'),
+                        'function': {
+                            'name': (tc.get('function') or {}).get('name'),
+                            'arguments': (tc.get('function') or {}).get('arguments'),
+                        },
+                    }
+                    for tc in tool_calls
+                ],
+            })
+
+            if not tool_calls:
+                return message.get('content') or ''
+
+            for tool_call in tool_calls:
+                result = self.tools.execute(tool_call)
+                self.messages.append({
+                    'role': 'tool',
+                    'tool_call_id': tool_call.get('id'),
+                    'content': json.dumps(result),
+                })
+
+
+# ==============================================================================
+# 6. INTEGRATED SUITE MICRO-TESTS
+# ==============================================================================
+class TestNightingaleCore(unittest.TestCase):
+    def setUp(self):
+        self.db_name = "test_nightingale_temp.db"
+        self.db = PatientMemoryDB(self.db_name)
+
+    def tearDown(self):
+        if os.path.exists(self.db_name):
+            os.remove(self.db_name)
+
+    def test_risk_evaluation_high(self):
+        res = MedicalAgentTools.evaluate_emergency_risk("I am experiencing crushing chest pain.")
+        self.assertEqual(res["risk_level"], "High")
+        self.assertTrue(res["escalation_required"])
+
+    def test_risk_evaluation_low(self):
+        res = MedicalAgentTools.evaluate_emergency_risk("I have a mild headache.")
+        self.assertEqual(res["risk_level"], "Low")
+        self.assertFalse(res["escalation_required"])
+
+    def test_memory_mutation_and_provenance(self):
+        self.db.add_or_update_record("pt_001", "medication", "Panadol", "active", "msg_1")
+        summary_1 = self.db.get_patient_profile_summary("pt_001")
+        self.assertIn("PANADOL", summary_1)
+
+        self.db.add_or_update_record("pt_001", "medication", "Panadol", "stopped", "msg_2")
+        summary_2 = self.db.get_patient_profile_summary("pt_001")
+        self.assertNotIn("PANADOL", summary_2)
+
+    def test_phi_redaction(self):
+        raw = "My name is John and My IC is 980101-14-5555 phone 0123456789"
+        clean = MedicalAgentTools.redact_phi(raw)
+        self.assertNotIn("980101-14-5555", clean)
+        self.assertNotIn("0123456789", clean)
+
+    def test_rbac(self):
+        self.assertTrue(RBAC.verify_access("pt_A", "pt_A", "patient"))
+        self.assertFalse(RBAC.verify_access("pt_A", "pt_B", "patient"))
+        self.assertTrue(RBAC.verify_access("doc_1", "pt_B", "clinician"))
+
+
+# ==============================================================================
+# 7. MAIN EXECUTION LOOP
+# ==============================================================================
+def main() -> None:
+    if len(sys.argv) > 1 and sys.argv[1] == "--test":
+        print("Running Nightingale Micro-Test Suite...")
+        unittest.main(argv=[sys.argv[0]], exit=True)
+
+    db = PatientMemoryDB()
+    current_patient_id = getpass.getuser()
+
+    Nightingale = Agent(model='qwen/qwen3.5-9b')
+
+    @Nightingale.context
+    def patient_living_memory() -> str:
+        summary = db.get_patient_profile_summary(current_patient_id)
+        return f"ACTIVE PATIENT PROFILE for '{current_patient_id}':\n{summary}"
+
+    @Nightingale.context
+    def system_context() -> str:
+        return (
+            f"Current Timestamp: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"Active Patient ID: {current_patient_id}\n"
+        )
+
+    @Nightingale.tool
+    def save_patient_record(
+        category: Annotated[str, "Must be one of: 'medication', 'allergy', 'symptom', 'chronic_condition', 'chief_complaint'"],
+        value: Annotated[str, "The specific item (e.g., 'Penicillin', 'Advil 200mg', 'Migraine')"],
+        status: Annotated[str, "Status: 'active', 'stopped', or 'resolved'"] = "active"
+    ) -> dict[str, str]:
+        """Mutates or updates structured patient profile history with provenance."""
+        provenance_id = f"msg_{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}"
+        result_msg = db.add_or_update_record(
+            patient_id=current_patient_id,
+            category=category,
+            value=value,
+            status=status,
+            provenance_pointer=provenance_id
+        )
+        return {"status": "success", "message": result_msg}
+
+    console = Console()
+    console.print("[bold green]Nightingale AI Core System Online.[/bold green] (Type 'quit' or 'exit' to end)\n")
+
+    while True:
+        console.print('[green]You:[/green] ', end='')
+        user_input = console.input()
+
+        if user_input.strip().lower() in {'quit', 'exit'}:
+            console.print('[dim]Session closed. Stay healthy![/dim]')
+            return
+
+        # Pre-Flight Risk Assessment
+        risk_eval = MedicalAgentTools.evaluate_emergency_risk(user_input)
+
+        if risk_eval["risk_level"] in ("High", "Med"):
+            profile_snap = db.get_patient_profile_summary(current_patient_id)
+            prov_ptr = f"msg_{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}"
+
+            esc_id = db.create_escalation(
+                patient_id=current_patient_id,
+                message=MedicalAgentTools.redact_phi(user_input),
+                summary=risk_eval["risk_reason"],
+                snapshot=profile_snap,
+                provenance=prov_ptr,
+                acquisition_context="terminal_session"
+            )
+
+            console.print(f"\n[bold red]ALERT ({risk_eval['risk_level']} Risk Detected):[/bold red] {risk_eval['patient_action']}")
+            console.print(f"[bold yellow][Send to Clinic Triggered][/bold yellow] Escalation Record #{esc_id} created for clinical triage.\n")
+            console.print("[dim]If this is an emergency, exit Nightingale and dial 999 for Emergency Services immediately.[/dim]\n")
+            continue
+
+        # Low Risk - Proceed to LLM Response Generation
+        with console.status('[dim]Nightingale is analyzing...[/dim]', spinner='arc'):
+            response = Nightingale.chat(user_input).strip()
+
+        console.print(f'\n[blue]Nightingale:[/blue] {response}')
+        console.print('[dim]If this is an emergency, exit Nightingale and dial 999 for Emergency Services.[/dim]\n')
+
+
+if __name__ == '__main__':
+    main()
+    
